@@ -12,6 +12,11 @@ parser.add_argument("--camera", default="OPENCV", type=str)
 parser.add_argument("--colmap_executable", default="", type=str)
 parser.add_argument("--glomap_executable", default="", type=str)
 parser.add_argument("--resize", action="store_true")
+# Sequential matching walks images in filename order. A stereo clip interleaves the two
+# cameras under one numbering, so a given overlap spans half as much time as it would
+# for a monocular clip; raise it to keep the same temporal reach.
+parser.add_argument("--overlap", type=int, default=0,
+                    help="SequentialMatching.overlap; 0 leaves COLMAP's default.")
 parser.add_argument("--magick_executable", default="", type=str)
 args = parser.parse_args()
 
@@ -20,15 +25,34 @@ glomap_command = '"{}"'.format(args.colmap_executable) if len(args.colmap_execut
 magick_command = '"{}"'.format(args.magick_executable) if len(args.magick_executable) > 0 else "magick"
 use_gpu = 1 if not args.no_gpu else 0
 
+# COLMAP 3.12 moved the backend-agnostic knobs (use_gpu, max_num_matches) out of the
+# SIFT-specific option groups into FeatureExtraction/FeatureMatching, and rejects the
+# old spelling outright. Probe rather than pin, so this runs on either side of 3.12.
+def _opt_group(subcommand, new, old):
+    import subprocess
+    try:
+        proc = subprocess.run([colmap_command.strip('"'), subcommand, "-h"],
+                              capture_output=True, text=True)
+    except OSError:
+        return old
+    # COLMAP prints the option list on stderr, help banner on stdout; read both.
+    return new if f"--{new}.use_gpu" in (proc.stdout + proc.stderr) else old
+
+EXTRACT_GROUP = _opt_group("feature_extractor", "FeatureExtraction", "SiftExtraction")
+MATCH_GROUP = _opt_group("sequential_matcher", "FeatureMatching", "SiftMatching")
+
 if not args.skip_matching:
     os.makedirs(args.source_path + "/distorted/sparse", exist_ok=True)
     ## Feature extraction
+    # Read from inputs/, not images/: images/ is where image_undistorter writes its
+    # output at the end of this script, and COLMAP's copy step throws if the
+    # destination file already exists. inputs/ holds the raw frames throughout.
     feat_extracton_cmd = colmap_command + " feature_extractor "\
         "--database_path " + args.source_path + "/distorted/database.db \
-        --image_path " + args.source_path + "/images \
+        --image_path " + args.source_path + "/inputs \
         --ImageReader.single_camera 1 \
         --ImageReader.camera_model " + args.camera + " \
-        --SiftExtraction.use_gpu " + str(use_gpu) 
+        --" + EXTRACT_GROUP + ".use_gpu " + str(use_gpu)
     
     if args.mask_path is None:
         args.mask_path = args.source_path + "/masks"
@@ -46,8 +70,11 @@ if not args.skip_matching:
     ## Feature matching
     feat_matching_cmd = colmap_command + " sequential_matcher \
         --database_path " + args.source_path + "/distorted/database.db \
-        --SiftMatching.use_gpu " + str(use_gpu) + \
-        " --SiftMatching.max_num_matches 16384"
+        --" + MATCH_GROUP + ".use_gpu " + str(use_gpu) + \
+        f" --{MATCH_GROUP}.max_num_matches 16384"
+    if args.overlap > 0:
+        feat_matching_cmd += f" --SequentialMatching.overlap {args.overlap}"
+    print(f"Executing: {feat_matching_cmd}")
     exit_code = os.system(feat_matching_cmd)
     if exit_code != 0:
         logging.error(f"Feature matching failed with code {exit_code}. Exiting.")

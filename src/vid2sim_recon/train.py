@@ -139,6 +139,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += normal_loss_weight(iteration) * normal_loss
             loss += geo_loss_weight(iteration) * geo_consistency_loss
 
+        # The monocular prior above is consumed by a patch-NCC loss, which is invariant to
+        # scale and offset, so it pins down the shape of the depth field but never its
+        # absolute value. That is enough to fit every training view and still leave the
+        # geometry metrically wrong, which shows up as smearing as soon as the camera
+        # leaves the capture path. LiDAR is the only metric reference available, so it
+        # enters as a plain L1 on inverse depth over the pixels that actually got a return.
+        if opt.lidar_depth_weight > 0 and viewpoint_cam.lidar_depth is not None:
+            lidar_inv_depth = viewpoint_cam.lidar_depth.to("cuda").float()
+            # Sweeps are sparse and land on dynamic objects too, which the alpha mask
+            # already excludes from the photometric term.
+            valid = (lidar_inv_depth > 0) & (gt_mask.squeeze() > 0)
+            if valid.any():
+                render_depth = render_pkg["depth"].squeeze(0)
+                render_inv_depth = 1.0 / (render_depth + 1e-9)
+                loss += opt.lidar_depth_weight * torch.abs(
+                    render_inv_depth[valid] - lidar_inv_depth[valid]).mean()
+
         loss.backward()
         iter_end.record()
 

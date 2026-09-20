@@ -37,6 +37,8 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    # Metric inverse depth from LiDAR, in SfM units, 0 where the sweep returned nothing.
+    lidar_depth: np.array = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -129,10 +131,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             conf = np.load(conf_path, allow_pickle=True)
             assert conf.shape == (height, width)
             
+        lidar_depth = None
+        lidar_path = image_path.replace("images", "lidar_depths")[:-4] + ".npy"
+        if os.path.exists(lidar_path):
+            lidar_depth = np.load(lidar_path, allow_pickle=True)
+            assert lidar_depth.shape == (height, width)
+
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX,
                               image=image, mask=mask, depth=depth, conf=conf,
                               image_path=image_path, image_name=image_name,
-                              width=width, height=height)
+                              width=width, height=height, lidar_depth=lidar_depth)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos

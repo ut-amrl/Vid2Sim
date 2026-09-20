@@ -94,6 +94,7 @@ class OptimizationParams(ParamGroup):
         self.scale_loss_weight = 100
         self.depth_l1_weight_init = 0.5
         self.depth_l1_weight_final = 0.1
+        self.lidar_depth_weight = 0.0
 
         self.normal_l1_weight_init = 0.1
         self.normal_l1_weight_final = 0.1

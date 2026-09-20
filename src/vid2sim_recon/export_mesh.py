@@ -95,7 +95,8 @@ def render_set(model_path, name, iteration, views, scene, gaussians, pipeline, b
             )
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, 
-                 max_depth : float, voxel_size : float, use_ground_mask : bool, use_sky_mask : bool):
+                 max_depth : float, voxel_size : float, use_ground_mask : bool, use_sky_mask : bool,
+                 angle_threshold : float = 15.0):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -110,7 +111,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         )
 
         render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras()+scene.getTestCameras(), scene, gaussians, pipeline, background, 
-                    max_depth=max_depth, volume=volume, use_ground_mask=use_ground_mask, use_sky_mask=use_sky_mask)
+                    max_depth=max_depth, volume=volume, use_ground_mask=use_ground_mask, use_sky_mask=use_sky_mask,
+                    angle_threshold=angle_threshold)
         
         print(f"extract_triangle_mesh")
         mesh = volume.extract_triangle_mesh()
@@ -139,6 +141,10 @@ if __name__ == "__main__":
     parser.add_argument("--voxel_size", default=0.1, type=float)
     parser.add_argument("--use_ground_mask", action="store_true")
     parser.add_argument("--use_sky_mask", action="store_true")
+    # Surfaces whose normal is within this angle of straight up are dropped from the TSDF,
+    # which removes the ground. Right for Unity, where the ground plane is added back in
+    # the editor; set 0 to keep the ground for a collision mesh.
+    parser.add_argument("--angle_threshold", default=15.0, type=float)
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
@@ -152,5 +158,6 @@ if __name__ == "__main__":
         args.max_depth, 
         args.voxel_size, 
         args.use_ground_mask,
-        args.use_sky_mask
+        args.use_sky_mask,
+        args.angle_threshold
     )

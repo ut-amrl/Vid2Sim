@@ -18,7 +18,7 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix, fov2focal
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, 
                  image, gt_depth, gt_alpha_mask, conf_map,
-                 image_name, uid,
+                 image_name, uid, lidar_depth=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
                  ):
         super(Camera, self).__init__()
@@ -48,6 +48,7 @@ class Camera(nn.Module):
         self.gt_depth = torch.tensor(gt_depth).to(self.data_device) if gt_depth is not None else None
         self.gt_alpha_mask = torch.tensor(gt_alpha_mask).to(self.data_device) if gt_alpha_mask is not None else None
         self.conf_map = torch.tensor(conf_map).to(self.data_device) if conf_map is not None else None
+        self.lidar_depth = torch.tensor(lidar_depth).to(self.data_device) if lidar_depth is not None else None
 
         self.zfar = 100.0
         self.znear = 0.01

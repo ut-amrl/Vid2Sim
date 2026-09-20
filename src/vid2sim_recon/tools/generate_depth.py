@@ -184,7 +184,13 @@ def process_batch(args, cam_batch, all_cams, pts, model_path, device):
 def process(args):
     path = args.path
     cam_infos = readColmapSceneInfo(path)
-    cam_infos = sorted(cam_infos, key=lambda x: int(x['image_path'].split('/')[-1].split('.')[0]))
+    # Ordering only needs to be deterministic. Stereo clips name frames "00007_left", so
+    # sort on the leading integer where there is one and fall back to the plain name.
+    def _order(cam):
+        stem = os.path.splitext(os.path.basename(cam['image_path']))[0]
+        head = stem.split('_')[0]
+        return (int(head), stem) if head.isdigit() else (0, stem)
+    cam_infos = sorted(cam_infos, key=_order)
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     gen_ply(bin_path, ply_path)
