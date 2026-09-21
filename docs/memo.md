@@ -329,6 +329,278 @@ micromamba run -n vid2sim-recon python train.py \
   --test_iterations 30000 --save_iterations 30000
 ```
 
+## Exporting a sim asset
+
+`tools/export_sim_asset.py` takes the trained splat and the TSDF mesh and emits both in
+metres, co-registered, with the collision layer cropped and cleaned.
+
+```bash
+micromamba run -n vid2sim-recon python tools/export_sim_asset.py \
+  -m output/stereo_lidar_w0.5 --radius 12.8 --fill-holes 0.5
+```
+
+Writes `output/<model>/sim_asset/`:
+
+| file | what |
+|---|---|
+| `splat_metric.ply` | appearance layer, metric and gravity aligned |
+| `collision_12.8m.ply` | full cropped mesh, ground included |
+| `obstacles_12.8m.ply` | same mesh with level surfaces removed, for use with the primitive |
+| `ground.ply` | support surface fitted locally along the route |
+| `drivable_area.json` | centreline, ±1.5 m bound, per-station support |
+| `manifest.json` | scale, frame, crop and every diagnostic below |
+
+The asset is metric and gravity aligned; see the two sections below for the frame and for
+how the splat's orientation-carrying fields are transformed.
+
+**Scale.** Two independent handles exist and they disagree by 2.2%. The LiDAR fit
+(`lidar_depth_scale.json`, 2.1790 m/unit) is a median over projected returns and carries
+the projection's bias. The stereo baseline (2.2288 m/unit) is a calibrated 24.5 cm
+constant measured directly between two reconstructed cameras with no depth estimate in the
+chain, so `--scale-from auto` prefers it when the scene is stereo. Corroboration: after
+scaling, the ground sits 0.46 m below the camera, which is the rig height.
+
+Scaling the splat is not just its positions. Gaussian extents are stored as logs, because
+the model applies `exp` as the scaling activation, so a factor `s` is `+log(s)` on
+`scale_*`. Multiplying there leaves every centre correct and every Gaussian the wrong
+size, which reads as a bad model rather than a unit bug.
+
+**Crop.** Vertices within `--radius` of the *nearest camera on the route*, not of the
+route's centroid, so the kept band is a tube following the trajectory rather than a sphere
+around its middle. 12.8 m gives a 25.6 m span, the SemanticKITTI BEV convention. This
+matters because the raw export reaches 121 m from a 27.9 m route: `--angle_threshold 0`
+has to be set to keep the ground, and it also stops rejecting distant grazing surfaces.
+
+The splat is deliberately left uncropped. Distant background is wanted for rendering even
+though it is useless for collision, and cutting it at 12.8 m would leave a void past the
+crop. `--splat-radius` overrides this.
+
+**Watertightness.** Reported, not assumed, and never achieved — correctly so. An outdoor
+capture is a surface, not a solid: sky, ground past the crop, and everything behind the
+facades are open by construction. What the report separates is loop size. Filling holes up
+to 0.5 m closes 234 of 287 loops, all of them few-edge reconstruction noise; the 53 that
+remain are led by a 1672-edge loop that is the outer rim, and capping that would dome the
+sky over the street. It also separates holes from non-manifold edges, since the latter are
+structural damage that hole filling cannot repair.
+
+### The crop radius is not the usable radius
+
+The number that decides how far a policy may wander is ground coverage, so the script
+raycasts down along the route and prints it:
+
+| lateral offset | route with ground under it |
+|---|---|
+| 0 m | 95.7% |
+| 1 m | 94.9% |
+| 2 m | 76.1% |
+| 4 m | 13.5% |
+| 8 m | 6.3% |
+
+Collision is trustworthy to roughly 1 m, and degrades hard past 2 m. A forward-facing walk
+never observes the ground a few metres to the side, so the TSDF has nothing to fuse there
+and the mesh simply stops — in a physics sim the robot falls through the world rather than
+colliding with it. The crop radius bounds the asset; it does not fill it.
+
+This is a tighter envelope than the appearance layer, which held up to ±1 m laterally with
+>98.9% alpha coverage. Anything wider needs either a ground primitive underneath to catch
+the robot, or a capture with lateral coverage.
+
+### Gravity alignment
+
+The asset comes out Z up, X forward, Y left (REP 103), origin on the ground beneath the
+first camera. `--keep-sfm-frame` opts out. Three estimates of up are available and none is
+usable alone, so the frame takes each angle from whichever one constrains it.
+
+| source | what it is | verdict |
+|---|---|---|
+| trajectory | third row of the Umeyama `R` in `sfm_metric_alignment.json` | pitch only |
+| attitude | gravity carried through LiDAR pose quaternions, extrinsics, and SfM poses | roll only |
+| ground fit | robust plane through the mesh under the route | not gravity |
+
+The trajectory fit aligns SfM camera centres to LiDAR positions, so pitch is pinned
+tightly. It is blind to roll: rotation about the direction of travel is constrained only
+by sideways spread, and this route is 107:1 straight (8.08 m of principal spread against
+0.24 m and 0.08 m), so a 4° roll moves the cameras under 2 cm against an 8 cm alignment
+residual. That axis is free.
+
+The attitude estimate reads a full orientation per frame, so nothing about it is
+degenerate, and 207 independent estimates scatter by a median of 0.59°. It is the only
+source of roll. But it inherits any pitch error in the sensor-to-camera extrinsic and
+lands 1.3° steep.
+
+The ground plane is not gravity at all, and assuming it is would have been the easy
+mistake. **The street genuinely climbs**: the LiDAR poses rise 2.02 m over 28.55 m
+travelled, a 4.04° grade. Fitting the surface and declaring it level would have rotated
+the hill out of the scene and put the robot on a flat road. It is kept only as a
+cross-check, since the angle between it and gravity should equal the grade.
+
+Validation: in the exported frame the route climbs **3.97°** against the LiDAR-measured
+4.04°, the camera sits 0.48 m above z=0 at the start against a 0.46 m rig height, and the
+ground spans −0.22 m to +12.12 m in z.
+
+Because the grade is preserved, a ground primitive added underneath must follow the slope.
+A horizontal plane at z=0 would cut through the road about 14 m along the route.
+
+### Rotating a splat is more than its positions
+
+Four things move and all four have to agree, or the asset is subtly wrong in a way that
+still renders plausibly:
+
+- **positions** scale then rotate;
+- **extents** are logs, so scaling is `+log(s)` and rotation leaves them alone;
+- **quaternions** compose with the rotation;
+- **spherical harmonics** encode view-dependent colour against world axes and must rotate
+  with them. Leaving them is the quiet failure: shading and speculars keep pointing the old
+  way, which reads as a badly trained model rather than a frame bug. It matters most here,
+  where SH degree 3 was measured overfitting by 8 dB and so carries a lot of the appearance.
+
+The basis in `sh_utils.py` has its own sign convention, so instead of hand-deriving
+Wigner-D matrices against it, `sh_rotation` fits the band matrices numerically from the
+repo's own evaluator — sample directions, evaluate at `d` and at `Rᵀd`, solve. Bands are
+closed under rotation so the fit is exact (verified at 8e-15, block diagonal, orthogonal
+per band) and it cannot drift out of sync with the convention it derives from.
+
+`tools/verify_sim_asset.py` checks the whole thing end to end by rendering the exported
+file through the transformed camera and comparing pixels:
+
+```bash
+cd src/vid2sim_recon && micromamba run -n vid2sim-recon \
+  python ../../tools/verify_sim_asset.py -m ../../output/stereo_lidar_w0.5 --frames 24
+```
+
+Median 84.9 dB against the original, mean absolute pixel difference 1.3e-3, and Gaussian
+covariances matching `s²RCRᵀ` to 1.4e-7 — float32 storage precision. A few views differ in
+dense canopy: the covariance check proves the geometry is exact, so what moves there is the
+blend order of overlapping semi-transparent splats, which shifts when every position is
+multiplied and rotated.
+
+## How Vid2Sim keeps the agent inside the corridor
+
+Worth reading before building on this, because the upstream answer is the opposite of what
+the export does by default, and it is the better answer.
+
+**Vid2Sim throws the reconstructed ground away.** `export_mesh.py` defaults to
+`--angle_threshold 15`, which drops every surface whose normal is within 15° of vertical,
+and `--use_ground_mask` additionally segments the ground out with SAM-HQ. What survives is
+only the vertical structure. Unity then supplies its own horizontal walkable plane, and
+both it and the scene mesh are tagged collidable but rendered invisible, with the splat
+providing all the visuals.
+
+That is exactly the right call given the coverage measured above. A forward-facing walk
+never sees the ground a few metres to the side, so a reconstructed ground surface is
+reliable for about 1 m and then stops existing. A synthetic plane is reliable everywhere,
+and the reconstructed facades, poles and parked cars become invisible collision walls that
+physically bound the corridor. The agent cannot leave because the geometry stops it.
+
+On top of that the paper terminates an episode on leaving the drivable area, exceeding
+3,000 steps, or exceeding three collisions, each worth −10, with start and goal randomised
+per episode and success declared within 0.5 m. The released config is a little different
+(`collision_limit: 5`, `max_episode_length: 60`), so the shipped numbers are not the
+paper's. Note also that `max_depth` defaults to 999 in the argparse while the function
+signature says 5.0 — the argparse wins, and that unbounded fusion is why the raw mesh
+reaches 121 m from a 27.9 m route.
+
+So there are four overlapping mechanisms, and the reconstruction only provides one:
+
+| mechanism | where it lives |
+|---|---|
+| synthetic ground plane replacing unreliable reconstructed ground | Unity scene |
+| invisible collision walls from reconstructed vertical geometry | TSDF mesh |
+| termination on leaving the drivable area or on repeated collisions | Unity build |
+| goals sampled along the captured route, short episodes | env config |
+
+### The support surface, fitted locally
+
+The export builds that layer. `ground.ply` is a ribbon following the route, plus
+`obstacles_<r>m.ply` — the collision mesh with surfaces within `--obstacle-angle` (15°, as
+upstream) of level removed — and `drivable_area.json` for the bound.
+
+A single tilted plane would have been the obvious shortcut and it is wrong twice over.
+It only holds while the whole clip shares one grade, and here the grade runs from **+0.38°
+to +6.73°** along 28 m, so one plane fitted to the lot drifts ~20 cm from the road through
+the middle of the route. Worse, it cannot represent the case actually worth planning for:
+a robot that runs down into a cul-de-sac and back up revisits the same ground at two
+heights, and no plane passes through both.
+
+So the surface is fitted per station, every 0.25 m, each taking its height and cross slope
+from ground within 2.5 m **measured along the route rather than through space**. Arc length
+is what makes doubling back work — the outbound and return legs are far apart along the
+route even when they sit on top of each other in the world. Stations with too little ground
+interpolate from neighbours instead of inventing a height, and the fit is trimmed so curbs,
+verges and car roofs caught by the wider probes cannot tilt a section.
+
+Measured against the reconstructed ground inside the ±1.5 m band:
+
+| | median | p90 abs | 
+|---|---|---|
+| local per-station fit | −0.4 cm | 7.3 cm |
+| one global plane | +0.8 cm | 17.7 cm |
+
+The medians are both fine — a global plane is unbiased on average, which is exactly why the
+median hides the problem. The p90 is the honest number and the local fit is 2.4× tighter.
+Largest step between neighbouring stations is 5.3 cm over 25 cm of travel, so nothing a
+robot would trip on. All 112 stations fitted directly here; none needed interpolation.
+
+**The drivable bound is ±1.5 m** (`--drivable-halfwidth`), inside the 1–2 m the coverage
+table supports, with the support surface running wider at ±4 m so the robot never reaches
+its edge. `drivable_area.json` carries the centreline, both edges, and a per-station
+`support` fraction recording how much of the band had real geometry under it — median 1.00,
+with 5 of 112 stations below half near the route ends. A rollout can terminate on leaving
+the band and treat thinly supported stations differently rather than trusting a flat number.
+
+The cross sections are the clearest argument for that bound: inside it the reconstruction
+sits on the fitted surface, and past about 2 m the "ground" a downward ray finds is curbs,
+walls and foliage standing 1.5–3 m proud.
+
+## Packaging the USDZ
+
+`tools/package_usdz.py` binds the layers into one file. It needs `usd-core`, which is not
+part of the original environment:
+
+```bash
+micromamba run -n vid2sim-recon pip install usd-core
+micromamba run -n vid2sim-recon python tools/package_usdz.py -m output/stereo_lidar_w0.5
+```
+
+The stage declares Z up and one unit per metre rather than leaving them to be inferred —
+the whole point of computing a gravity frame is lost if the consumer has to guess. Three
+roles, split the way upstream Vid2Sim splits them:
+
+| prim | type | role |
+|---|---|---|
+| `/World/Collision/Ground` | Mesh | support surface, **invisible**, triangle-mesh collider |
+| `/World/Collision/Obstacles` | Mesh | reconstructed obstacles, **invisible**, triangle-mesh collider |
+| `/World/Appearance/Splat` | Points | the splat, visible, no collision |
+| `/World/Navigation/Centreline` | BasisCurves | guide purpose, neither renders nor collides |
+| `/World/Navigation/DrivableArea` | Mesh | guide purpose, carries `nav:halfWidthMeters` and per-station `nav:support` |
+
+Collision approximation is `none`, i.e. the triangles themselves. Convex or SDF
+approximations would be meaningless here: a reconstructed street is an open surface with no
+inside, which is the same reason the watertightness report above never reaches "yes".
+
+The splat is written as a native `UsdGeomPoints` with the full Gaussian state in primvars
+(`gsplat:scale`, `gsplat:rotation`, `gsplat:opacity`, `gsplat:shDC`, `gsplat:shRest` with
+`elementSize` 45) rather than as a `.ply` packaged alongside. A sidecar would write faster
+but would leave the asset only half described by USD. Activations are applied on the way in
+— `exp` on the extents so they are metres, `sigmoid` on opacity — and the prim says so in
+`gsplat:scaleActivation` and `gsplat:opacityActivation`, because a consumer cannot tell by
+looking. `points` and `displayColor` double as a preview that opens in any USD viewer.
+
+Verified by reading the package back: positions, extents, quaternions, opacity and all 45
+higher SH coefficients round-trip at **exactly zero error**, and raycasting the collision
+prims extracted from the USDZ supports 99.1% of the ±1.5 m band.
+
+`--stride N` subsamples the splat and `--no-sh` drops the higher bands for a roughly 3×
+smaller file, at the cost of the view-dependent appearance the LiDAR work went to trouble
+to get right. `--full-mesh` collides against the whole cropped mesh instead of the
+obstacle-plus-support pair, which is the wrong default for training but useful for
+inspecting what the reconstruction actually contains.
+
+One caveat worth stating plainly: USD has no native Gaussian-splat schema, so nothing will
+render this as splats out of the box. The geometry, physics and frame are standard USD and
+will load anywhere; the appearance layer is a faithful container that a 3DGS renderer — or
+a conversion to Isaac Sim's NuRec representation — has to consume.
+
 ## Code map
 
 Added or changed for LiDAR supervision:
@@ -338,6 +610,9 @@ Added or changed for LiDAR supervision:
 | `tools/lidar_depth.py` | sweeps → per-camera metric inverse depth; fits the metric scale |
 | `tools/validate_lidar_depth.py` | scores that projection against stereo or SfM |
 | `tools/perturbation_sweep.py` | translation × rotation grid at waypoints |
+| `tools/export_sim_asset.py` | metric, gravity-aligned splat + cropped collision mesh |
+| `tools/verify_sim_asset.py` | renders the export against the original to prove the transform |
+| `tools/package_usdz.py` | binds splat, collision and navigation layers into one USDZ |
 | `src/vid2sim_recon/train.py` | L1 inverse-depth term, gated on `--lidar_depth_weight` |
 | `src/vid2sim_recon/arguments/__init__.py` | `lidar_depth_weight`, default 0 |
 | `scene/dataset_readers.py`, `utils/camera_utils.py`, `scene/cameras.py` | `lidar_depth` field |
